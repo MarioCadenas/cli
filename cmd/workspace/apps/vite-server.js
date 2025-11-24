@@ -180,10 +180,8 @@ function queryTypesPlugin() {
 export type QueryName =
 ${queryNames.map((n) => `  | '${n}'`).join("\n")};
 
-// Type for the queries object injected by the server
 export type Queries = Record<QueryName, string>;
 
-// Extend Window interface to include appConfig
 declare global {
   interface Window {
     appConfig: {
@@ -192,7 +190,6 @@ declare global {
   }
 }
 
-// Export empty object to ensure this is treated as a module
 export {};
 `;
 

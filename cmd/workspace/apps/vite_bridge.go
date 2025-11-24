@@ -55,6 +55,7 @@ type ViteBridgeMessage struct {
 	RequestID string         `json:"requestId"`
 	Approved  bool           `json:"approved"`
 	Content   string         `json:"content,omitempty"`
+	Files     []string       `json:"files,omitempty"`
 	Error     string         `json:"error,omitempty"`
 }
 
@@ -333,6 +334,15 @@ func (vb *ViteBridge) handleMessage(msg *ViteBridgeMessage) error {
 		}(*msg)
 		return nil
 
+	case "file:list":
+		// Handle directory listing requests in parallel like fetch requests
+		go func(fileListMsg ViteBridgeMessage) {
+			if err := vb.handleFileListRequest(&fileListMsg); err != nil {
+				log.Errorf(vb.ctx, "[vite_bridge] Error handling file list request for %s: %v", fileListMsg.Path, err)
+			}
+		}(*msg)
+		return nil
+
 	case "hmr:message":
 		return vb.handleHMRMessage(msg)
 
@@ -519,6 +529,81 @@ func (vb *ViteBridge) handleFileReadRequest(msg *ViteBridgeMessage) error {
 	return nil
 }
 
+func (vb *ViteBridge) handleFileListRequest(msg *ViteBridgeMessage) error {
+	log.Debugf(vb.ctx, "[vite_bridge] File list request: %s", msg.Path)
+
+	if err := validateDirectoryPath(msg.Path); err != nil {
+		log.Warnf(vb.ctx, "[vite_bridge] Directory validation failed for %s: %v", msg.Path, err)
+		return vb.sendFileListError(msg.RequestID, fmt.Sprintf("Invalid directory path: %v", err))
+	}
+
+	entries, err := os.ReadDir(msg.Path)
+
+	response := ViteBridgeMessage{
+		Type:      "file:list:response",
+		RequestID: msg.RequestID,
+	}
+
+	if err != nil {
+		log.Errorf(vb.ctx, "[vite_bridge] Failed to list directory %s: %v", msg.Path, err)
+		response.Error = err.Error()
+	} else {
+		var files []string
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				files = append(files, entry.Name())
+			}
+		}
+		log.Debugf(vb.ctx, "[vite_bridge] Listed %d files in %s", len(files), msg.Path)
+		response.Files = files
+	}
+
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal file list response: %w", err)
+	}
+
+	select {
+	case vb.tunnelWriteChan <- prioritizedMessage{
+		messageType: websocket.TextMessage,
+		data:        responseData,
+		priority:    1,
+	}:
+	case <-time.After(wsWriteTimeout):
+		return errors.New("timeout sending file list response")
+	}
+
+	return nil
+}
+
+func validateDirectoryPath(requestedPath string) error {
+	// Clean the path to resolve any ../ or ./ components
+	cleanPath := filepath.Clean(requestedPath)
+
+	// Get absolute path
+	absPath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve absolute path: %w", err)
+	}
+
+	// Get the working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	// Construct the allowed base directory (absolute path)
+	allowedDir := filepath.Join(cwd, allowedBasePath)
+
+	// Ensure the resolved path matches the allowed directory exactly
+	// We only allow listing the specific queries directory, not subdirectories
+	if absPath != allowedDir {
+		return fmt.Errorf("path %s must be exactly %s", absPath, allowedBasePath)
+	}
+
+	return nil
+}
+
 func validateFilePath(requestedPath string) error {
 	// Clean the path to resolve any ../ or ./ components
 	cleanPath := filepath.Clean(requestedPath)
@@ -579,6 +664,31 @@ func (vb *ViteBridge) sendFileReadError(requestID, errorMsg string) error {
 	}:
 	case <-time.After(wsWriteTimeout):
 		return errors.New("timeout sending file read error")
+	}
+
+	return nil
+}
+
+func (vb *ViteBridge) sendFileListError(requestID, errorMsg string) error {
+	response := ViteBridgeMessage{
+		Type:      "file:list:response",
+		RequestID: requestID,
+		Error:     errorMsg,
+	}
+
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal error response: %w", err)
+	}
+
+	select {
+	case vb.tunnelWriteChan <- prioritizedMessage{
+		messageType: websocket.TextMessage,
+		data:        responseData,
+		priority:    1,
+	}:
+	case <-time.After(wsWriteTimeout):
+		return errors.New("timeout sending file list error")
 	}
 
 	return nil
